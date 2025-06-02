@@ -1,6 +1,8 @@
 
 # Go Echo Sidecar Demo
 
+![](preview.png)
+
 This project demonstrates:
 - Building a Go Echo web server with metrics and logging
 - Dockerizing the server
