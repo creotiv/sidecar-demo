@@ -1,0 +1,213 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: go-echo-app
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    app: go-echo-app
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+    - name: envoy
+      port: 8081
+      targetPort: 8081
+      protocol: TCP
+    - name: envoy-admin
+      port: 8082
+      targetPort: 8082
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: go-echo-app-nodeport
+  namespace: default
+spec:
+  type: NodePort
+  selector:
+    app: go-echo-app
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30000
+    - name: envoy
+      port: 8081
+      targetPort: 8081
+      nodePort: 30005
+    - name: envoy-admin
+      port: 8082
+      targetPort: 8082
+      nodePort: 30006
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-echo-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: go-echo-app
+  template:
+    metadata:
+      labels:
+        app: go-echo-app
+    spec:
+      containers:
+        - name: main
+          image: github.com/creotiv/sidecar-demo:latest
+          imagePullPolicy: Never 
+          env:
+            - name: LOG_PATH
+              value: /app/logs/app.log
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: logs
+              mountPath: /app/logs
+        - name: promtail
+          image: grafana/promtail:latest
+          args: ["-config.file=/etc/promtail/promtail.yaml"]
+          volumeMounts:
+            - name: logs
+              mountPath: /app/logs
+            - name: promtail-config
+              mountPath: /etc/promtail
+        - name: envoy
+          image: envoyproxy/envoy:v1.33-latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8081  # Envoy listens here
+          volumeMounts:
+            - name: envoy-config
+              mountPath: /etc/envoy
+          command: ["/usr/local/bin/envoy", "-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+        - name: metrics-sidecar
+          image: prom/prometheus:latest
+          args: ["--config.file=/etc/prometheus/prometheus.yml"]
+          volumeMounts:
+            - name: prometheus-config
+              mountPath: /etc/prometheus
+      volumes:
+        - name: logs
+          emptyDir: {}
+        - name: promtail-config
+          configMap:
+            name: promtail-sidecar-config-map
+        - name: prometheus-config
+          configMap:
+            name: prometheus-sidecar-config-map
+        - name: envoy-config
+          configMap:
+            name: envoy-sidecar-config-map
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail-sidecar-config-map
+data:
+  promtail.yaml: |
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+    positions:
+      filename: /tmp/positions.yaml
+    clients:
+      - url: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
+    scrape_configs:
+      - job_name: go-echo-logs
+        static_configs:
+          - targets:
+              - localhost
+            labels:
+              job: go-echo
+              __path__: /app/logs/*.log
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-sidecar-config-map
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: 'go-echo-app'
+        static_configs:
+          - targets: ['go-echo-app.default.svc.cluster.local:8080']
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: envoy-sidecar-config-map
+  namespace: default  # Add namespace for consistency
+data:
+  envoy.yaml: |
+    admin:
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8082
+    static_resources:
+      listeners:
+      - name: listener_0
+        address:
+          socket_address:
+            address: 0.0.0.0
+            port_value: 8081
+        filter_chains:
+        - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              stat_prefix: ingress_http
+              codec_type: AUTO
+              route_config:
+                name: local_route
+                virtual_hosts:
+                - name: backend
+                  domains: ["*"]
+                  routes:
+                  - match:
+                      prefix: "/"
+                    route:
+                      cluster: service_backend
+              http_filters:
+                - name: envoy.filters.http.bandwidth_limit
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.bandwidth_limit.v3.BandwidthLimit
+                    stat_prefix: ingress_bandwidth_limit
+                    enable_mode: REQUEST_AND_RESPONSE
+                    # limit_kbps is in KB/s. 32 KB/s means 32 here.
+                    limit_kbps: 1
+                    fill_interval: 0.1s
+                - name: envoy.filters.http.fault
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault
+                    abort:
+                      percentage:
+                        numerator: 50
+                      http_status: 503
+                - name: envoy.filters.http.router
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      clusters:
+      - name: service_backend
+        connect_timeout: 0.25s
+        type: LOGICAL_DNS
+        dns_lookup_family: V4_ONLY
+        lb_policy: ROUND_ROBIN
+        load_assignment:
+          cluster_name: service_backend
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 127.0.0.1
+                    port_value: 8080

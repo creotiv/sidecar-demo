@@ -1,0 +1,6 @@
+app.log
+app.tar
+k6.js
+Makefile
+deploy/
+.gitignore
